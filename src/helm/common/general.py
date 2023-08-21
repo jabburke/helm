@@ -12,6 +12,9 @@ from tqdm import tqdm
 import pyhocon
 from dataclasses import asdict, is_dataclass
 
+from pathlib import Path
+from cloudpathlib import CloudPath
+
 from helm.common.hierarchical_logger import hlog, htrack, htrack_block
 
 
@@ -169,19 +172,44 @@ def serialize(obj: Any) -> List[str]:
     return [f"{key}: {json.dumps(value)}" for key, value in asdict(obj).items()]
 
 
-def write(file_path: str, content: str):
+def write(*file_path: str, content: str, local_base_path: Path = None, cloud_base_path: CloudPath = None):
     """Write content out to a file at path file_path."""
-    hlog(f"Writing {len(content)} characters to {file_path}")
-    with open(file_path, "w") as f:
-        f.write(content)
+
+    if local_base_path is not None:
+        local_file_path: Path = Path(local_base_path, *file_path).resolve()
+        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        hlog(f"Writing {len(content)} characters to {local_file_path}")
+        with open(local_file_path, "w") as f:
+            f.write(content)
+
+    if cloud_base_path is not None:
+        cloud_file_path: CloudPath = CloudPath.joinpath(cloud_base_path, *file_path)
+
+        hlog(f"Writing {len(content)} characters to {cloud_file_path}")
+        with cloud_file_path.open("w") as f:
+            f.write(content)
 
 
-def write_lines(file_path: str, lines: List[str]):
+def write_lines(*file_path: str, lines: List[str], local_base_path: Path = None, cloud_base_path: CloudPath = None):
     """Write lines out to a file at path file_path."""
-    hlog(f"Writing {len(lines)} lines to {file_path}")
-    with open(file_path, "w") as f:
-        for line in lines:
-            print(line, file=f)
+
+    if local_base_path is not None:
+        local_file_path: Path = Path(local_base_path, *file_path).resolve()
+        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        hlog(f"Writing {len(lines)} lines to {local_file_path}")
+        with open(local_file_path, "w") as f:
+            for line in lines:
+                print(line, file=f)
+
+    if cloud_base_path is not None:
+        cloud_file_path: CloudPath = CloudPath.joinpath(cloud_base_path, *file_path)
+
+        hlog(f"Writing {len(lines)} lines to {cloud_file_path}")
+        with open(cloud_file_path, "w") as f:
+            for line in lines:
+                print(line, file=f)
 
 
 def indent_lines(lines: List[str], count: int = 2) -> List[str]:

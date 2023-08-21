@@ -26,6 +26,7 @@ cffi==1.15.1
 cfgv==3.3.1
 charset-normalizer==2.1.1
 click==8.0.4
+cloudpathlib==0.15.1
 colorama==0.4.5
 contourpy==1.0.5
 cycler==0.11.0
