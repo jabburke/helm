@@ -2,8 +2,9 @@ import json
 import os
 from typing import List
 
-from helm.common.general import ensure_file_downloaded
+from helm.common.general import ensure_file_downloaded, joinpath
 from .scenario import Scenario, Instance, Reference, TRAIN_SPLIT, VALID_SPLIT, TEST_SPLIT, CORRECT_TAG, Input, Output
+
 
 
 class LegalSupportScenario(Scenario):
@@ -52,7 +53,8 @@ class LegalSupportScenario(Scenario):
     tags = ["question_answering", "law"]
 
     def get_instances(self) -> List[Instance]:
-        data_path: str = os.path.join(self.output_path, "data")
+        data_path = joinpath(self.output_path, "data")
+
         ensure_file_downloaded(
             source_url="https://docs.google.com/uc?export=download&id=1PVoyddrCHChMxYrLhsI-zu7Xzs5S8N77",
             target_path=data_path,
@@ -68,7 +70,7 @@ class LegalSupportScenario(Scenario):
         }
 
         for split in splits:
-            json_path: str = os.path.join(data_path, "legal_support", f"{split}.jsonl")
+            json_path: str = joinpath(data_path, "legal_support", f"{split}.jsonl")
             with open(json_path) as f:
                 all_raw_data = f.readlines()
 
