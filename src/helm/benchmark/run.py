@@ -72,7 +72,8 @@ def run_benchmarking(
     url: Optional[str],
     local_path: str,
     num_threads: int,
-    output_path: str,
+    local_output_path: str,
+    cloud_output_path: str,
     suite: str,
     dry_run: bool,
     skip_instances: bool,
@@ -98,7 +99,8 @@ def run_benchmarking(
     runner_cls = SlurmRunner if use_slurm_runner else Runner
     runner: Runner = runner_cls(
         execution_spec,
-        output_path,
+        local_output_path,
+        cloud_output_path,
         suite,
         skip_instances,
         cache_instances,
@@ -112,7 +114,10 @@ def run_benchmarking(
 
 def add_run_args(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "-o", "--output-path", type=str, help="Where to save all the output", default="benchmark_output"
+        "-o", "--local-output-path", type=str, help="Where to save all the output", default=None
+    )
+    parser.add_argument(
+        "-co", "--cloud-output-path", type=str, help="Where to save all the cloud output", default=None
     )
     parser.add_argument("-n", "--num-threads", type=int, help="Max number of threads to make requests", default=4)
     parser.add_argument(
@@ -310,7 +315,8 @@ def main():
         url=args.server_url,
         local_path=args.local_path,
         num_threads=args.num_threads,
-        output_path=args.output_path,
+        local_output_path=args.local_output_path,
+        cloud_output_path=args.cloud_output_path,
         suite=args.suite,
         dry_run=args.dry_run,
         skip_instances=args.skip_instances,

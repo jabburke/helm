@@ -1,11 +1,18 @@
+import contextlib
+
 from filelock import FileLock
 import json
 import os
 import shlex
 import subprocess
 import uuid
+import gzip
+import shutil
+import tarfile
+import zipfile
+import tempfile
 import zstandard
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from tqdm import tqdm
 
@@ -37,9 +44,14 @@ def flatten_list(ll: List):
     return sum(map(flatten_list, ll), []) if isinstance(ll, list) else [ll]
 
 
-def ensure_directory_exists(path: str):
+def ensure_directory_exists(path: Union[str, Path, CloudPath]):
     """Create `path` if it doesn't exist."""
-    os.makedirs(path, exist_ok=True)
+    if isinstance(path, CloudPath):
+        path.mkdir(parents=True, exist_ok=True)
+    elif isinstance(path, Path):
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        os.makedirs(path, exist_ok=True)
 
 
 def parse_hocon(text: str):
@@ -69,24 +81,25 @@ def shell(args: List[str]):
 @htrack(None)
 def ensure_file_downloaded(
     source_url: str,
-    target_path: str,
+    target_path: Union[Path, CloudPath],
     unpack: bool = False,
     downloader_executable: str = "wget",
     unpack_type: Optional[str] = None,
 ):
     """Download `source_url` to `target_path` if it doesn't exist."""
-    with FileLock(f"{target_path}.lock"):
-        if os.path.exists(target_path):
-            # Assume it's all good
-            hlog(f"Not downloading {source_url} because {target_path} already exists")
-            return
 
+    if target_path.exists():
+        # Assume it's all good
+        hlog(f"Not downloading {source_url} because {target_path} already exists")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
         # Download
         # gdown is used to download large files/zip folders from Google Drive.
         # It bypasses security warnings which wget cannot handle.
         if source_url.startswith("https://drive.google.com"):
             downloader_executable = "gdown"
-        tmp_path: str = f"{target_path}.tmp"
+        tmp_path: str = f"{tmp_dir}.tmp"
         shell([downloader_executable, source_url, "-O", tmp_path])
 
         # Unpack (if needed) and put it in the right location
@@ -101,35 +114,73 @@ def ensure_file_downloaded(
                 else:
                     raise Exception("Failed to infer the file format from source_url. Please specify unpack_type.")
 
-            tmp2_path = target_path + ".tmp2"
-            ensure_directory_exists(tmp2_path)
+            tmp_unpack_path: str = f"{tmp_path}.unpack.tmp"
+
             if unpack_type == "untar":
-                shell(["tar", "xf", tmp_path, "-C", tmp2_path])
+                with tarfile.open(tmp_path, "r") as tf:
+                    tf.extractall(path=tmp_unpack_path)
             elif unpack_type == "unzip":
-                shell(["unzip", tmp_path, "-d", tmp2_path])
+                with zipfile.ZipFile(tmp_path, "r") as zf:
+                    zf.extractall(path=tmp_unpack_path)
             elif unpack_type == "unzstd":
                 dctx = zstandard.ZstdDecompressor()
-                with open(tmp_path, "rb") as ifh, open(os.path.join(tmp2_path, "data"), "wb") as ofh:
+                with open(tmp_path, "rb") as ifh, open(os.path.join(tmp_unpack_path, "data"), "wb") as ofh:
                     dctx.copy_stream(ifh, ofh)
             else:
                 raise Exception("Invalid unpack_type")
-            files = os.listdir(tmp2_path)
-            if len(files) == 1:
-                # If contains one file, just get that one file
-                shell(["mv", os.path.join(tmp2_path, files[0]), target_path])
-                os.rmdir(tmp2_path)
+
+            # clean-up any OS generated files
+            for file_or_dir in Path(tmp_unpack_path).glob('**/*'):
+
+                if file_or_dir.is_dir() and file_or_dir.name == '__MACOSX':
+                    shutil.rmtree(file_or_dir)
+
+                if file_or_dir.is_file() and file_or_dir.name == '.DS_Store':
+                    file_or_dir.unlink()
+
+            # Upload / Move into the right location
+            if isinstance(target_path, CloudPath):
+                target_path.upload_from(tmp_unpack_path, force_overwrite_to_cloud=False)
+
+            elif isinstance(target_path, Path):
+                ensure_directory_exists(target_path)
+                Path(tmp_unpack_path).rename(target_path)
+
             else:
-                shell(["mv", tmp2_path, target_path])
-            os.unlink(tmp_path)
+                pass
+
         else:
             # Don't decompress if desired `target_path` ends with `.gz`.
             if source_url.endswith(".gz") and not target_path.endswith(".gz"):
-                gzip_path = f"{target_path}.gz"
-                shell(["mv", tmp_path, gzip_path])
-                # gzip writes its output to a file named the same as the input file, omitting the .gz extension
-                shell(["gzip", "-d", gzip_path])
+                gzip_path = f"{tmp_dir}.gz"
+
+                with open(tmp_path, 'rb') as f_in, open(gzip_path, 'wb') as f_out:
+                    decompressed_data = gzip.decompress(f_in.read())
+                    f_out.write(decompressed_data)
+
+                    # Upload / Move into the right location
+                    if isinstance(target_path, CloudPath):
+                        target_path.upload_from(gzip_path, force_overwrite_to_cloud=False)
+
+                    elif isinstance(target_path, Path):
+                        ensure_directory_exists(target_path)
+                        Path(gzip_path).rename(target_path)
+
+                    else:
+                        pass
+
             else:
-                shell(["mv", tmp_path, target_path])
+                # Upload / Move into the right location
+                if isinstance(target_path, CloudPath):
+                    target_path.upload_from(tmp_path, force_overwrite_to_cloud=False)
+
+                elif isinstance(target_path, Path):
+                    ensure_directory_exists(target_path)
+                    Path(tmp_path).rename(target_path)
+
+                else:
+                    pass
+
         hlog(f"Finished downloading {source_url} to {target_path}")
 
 
@@ -172,11 +223,27 @@ def serialize(obj: Any) -> List[str]:
     return [f"{key}: {json.dumps(value)}" for key, value in asdict(obj).items()]
 
 
-def write(*file_path: str, content: str, local_base_path: Path = None, cloud_base_path: CloudPath = None):
+def move(source_path, target_path):
+    pass
+
+
+def joinpath(base_path: [str, os.PathLike, Path, CloudPath], *args: Union[str, os.PathLike]):
+
+    if isinstance(base_path, CloudPath):
+        return CloudPath.joinpath(base_path, *args)
+
+    elif isinstance(base_path, Path):
+        return Path.joinpath(base_path, *args)
+
+    else:
+        return os.path.join(base_path, *args)
+
+
+def write(*args: str, content: str, local_base_path: Path = None, cloud_base_path: CloudPath = None):
     """Write content out to a file at path file_path."""
 
     if local_base_path is not None:
-        local_file_path: Path = Path(local_base_path, *file_path).resolve()
+        local_file_path: Path = Path(local_base_path, *args).resolve()
         local_file_path.parent.mkdir(parents=True, exist_ok=True)
 
         hlog(f"Writing {len(content)} characters to {local_file_path}")
@@ -184,11 +251,14 @@ def write(*file_path: str, content: str, local_base_path: Path = None, cloud_bas
             f.write(content)
 
     if cloud_base_path is not None:
-        cloud_file_path: CloudPath = CloudPath.joinpath(cloud_base_path, *file_path)
+        cloud_file_path: CloudPath = CloudPath.joinpath(cloud_base_path, *args)
 
         hlog(f"Writing {len(content)} characters to {cloud_file_path}")
         with cloud_file_path.open("w") as f:
             f.write(content)
+
+    if len(args) == 1 and hasattr(args, 'open'):
+        print(args)
 
 
 def write_lines(*file_path: str, lines: List[str], local_base_path: Path = None, cloud_base_path: CloudPath = None):

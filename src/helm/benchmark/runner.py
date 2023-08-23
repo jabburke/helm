@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 from tqdm import tqdm
 
-from helm.common.general import ensure_directory_exists, write, asdict_without_nones
+from helm.common.general import ensure_directory_exists, write, asdict_without_nones, joinpath
 from helm.common.hierarchical_logger import hlog, htrack_block
 from helm.common.cache import cache_stats
 from .augmentations.data_augmenter import DataAugmenterSpec
@@ -26,6 +26,10 @@ from .metrics.metric_service import MetricService
 from .metrics.metric import Metric, MetricSpec, MetricResult, PerInstanceStats, create_metric, Stat
 from .window_services.tokenizer_service import TokenizerService
 
+import pathlib
+from pathlib import Path
+import cloudpathlib
+from cloudpathlib import CloudPath
 
 LATEST_SYMLINK: str = "latest"
 
@@ -79,7 +83,8 @@ class Runner:
     def __init__(
         self,
         execution_spec: ExecutionSpec,
-        output_path: str,
+        local_output_path: str,
+        cloud_output_path: str,
         suite: str,
         skip_instances: bool,
         cache_instances: bool,
@@ -87,6 +92,7 @@ class Runner:
         skip_completed_runs: bool,
         exit_on_error: bool,
     ):
+        print('execution_spec', execution_spec)
         self.executor = Executor(execution_spec)
         self.dry_run: bool = execution_spec.dry_run
         self.tokenizer_service = TokenizerService(self.executor.service, execution_spec.auth)
@@ -97,34 +103,48 @@ class Runner:
         self.skip_completed_runs: bool = skip_completed_runs
         self.exit_on_error: bool = exit_on_error
 
-        ensure_directory_exists(output_path)
+        if local_output_path is not None:
+            self.local_base_path = pathlib.Path(local_output_path).resolve()
+
+        else:
+            self.local_base_path = None
+
+        if cloud_output_path is not None:
+
+            if cloud_output_path.startswith('s3://'):
+                s3_client = cloudpathlib.s3.S3Client()
+                self.cloud_base_path = cloudpathlib.s3.S3Path(cloud_output_path, client=s3_client)
+
+        else:
+            self.cloud_base_path = None
+
+        if self.local_base_path is None and self.cloud_base_path is None:
+            raise ValueError('a local or cloud path must be provided')
+
         # Decide where to save the raw data (e.g., "output/scenarios/mmlu").
-        self.scenarios_path: str = os.path.join(output_path, "scenarios")
-        ensure_directory_exists(self.scenarios_path)
+        self.scenarios_path: str = "scenarios"
+
         # Decide where to save input instances
-        self.instances_path: str = os.path.join(output_path, "scenario_instances")
-        ensure_directory_exists(self.instances_path)
+        self.instances_path: str = "scenario_instances"
 
         # Output the results under a folder with the name of the suite
-        self.runs_path: str = os.path.join(output_path, "runs", suite)
+        self.runs_path: str = f"runs/{suite}"
 
         # The path where to cache files needs to compute metrics, e.g., human evaluation results
-        self.eval_cache_path: str = os.path.join(self.runs_path, "eval_cache")
-        ensure_directory_exists(self.eval_cache_path)
+        self.eval_cache_path: str = f"{self.runs_path}/eval_cache"
 
     def _is_run_completed(self, run_spec: RunSpec):
-        """Return whether the run was previously completed.
-
+        """Return whether the run was previously completed
         A run is completed if all of the expected output files exist."""
-        run_path: str = os.path.join(self.runs_path, run_spec.name)
+        run_path: str = joinpath(self.runs_path, run_spec.name)
         if not os.path.isdir(run_path):
             return False
         output_paths = [
-            os.path.join(run_path, "run_spec.json"),
-            os.path.join(run_path, "scenario.json"),
-            os.path.join(run_path, "scenario_state.json"),
-            os.path.join(run_path, "stats.json"),
-            os.path.join(run_path, "per_instance_stats.json"),
+            joinpath(run_path, "run_spec.json"),
+            joinpath(run_path, "scenario.json"),
+            joinpath(run_path, "scenario_state.json"),
+            joinpath(run_path, "stats.json"),
+            joinpath(run_path, "per_instance_stats.json"),
         ]
         for output_path in output_paths:
             if not os.path.exists(output_path):
@@ -153,17 +173,28 @@ class Runner:
         scenario: Scenario = create_scenario(run_spec.scenario_spec)
 
         # This `output_path` will be used when `Adapter` calls `Scenario.get_instances`.
-        scenario.output_path = os.path.join(self.scenarios_path, scenario.name)
-        ensure_directory_exists(scenario.output_path)
+        if self.cloud_base_path is not None:
+            scenario.output_path = joinpath(self.cloud_base_path, f"{self.scenarios_path}/{scenario.name}")
+        else:
+            scenario.output_path = joinpath(self.local_base_path, f"{self.scenarios_path}/{scenario.name}")
 
         # This 'output_path' will be used when the model's input instances are saved.
         args_str = ",".join([f"{k}={v}" for k, v in sorted(run_spec.scenario_spec.args.items())])
-        scenario_name_with_args = f"{scenario.name}:{args_str}" if args_str else f"{scenario.name}"
-        input_instances_output_path = os.path.join(self.instances_path, scenario_name_with_args)
-        input_instances_file_path = os.path.join(input_instances_output_path, "input_instances.json")
+        scenario_name_with_args: str = f"{scenario.name}:{args_str}" if args_str else f"{scenario.name}"
+        input_instance_output_path: str = f"{self.instances_path}/{scenario_name_with_args}"
+        if self.cloud_base_path is not None:
+            input_instances_file_path = joinpath(
+                self.cloud_base_path,
+                f"{self.instances_path}/{scenario_name_with_args}/input_instances.json"
+            )
 
-        run_path: str = os.path.join(self.runs_path, run_spec.name)
-        ensure_directory_exists(run_path)
+        else:
+            input_instances_file_path = joinpath(
+                self.local_base_path,
+                f"{self.instances_path}/{scenario_name_with_args}/input_instances.json"
+            )
+
+        run_path: str = f"{self.runs_path}/{run_spec.name}"
 
         if self.skip_completed_runs and self._is_run_completed(run_spec):
             # If scenario_state.json exists, assume that all other output files exist
@@ -177,8 +208,9 @@ class Runner:
         instances: List[Instance]
         if self.skip_instances:
             instances = []
+
         else:
-            if self.cache_instances and os.path.exists(input_instances_file_path):
+            if self.cache_instances and input_instances_file_path.exists():
                 with open(input_instances_file_path) as f:
                     json_instances: List[Dict[str, Any]] = json.load(f)
                 instances = [dacite.from_dict(Instance, instance) for instance in json_instances]
@@ -186,13 +218,16 @@ class Runner:
                 # Create the instances of the scenario
                 with htrack_block("scenario.get_instances"):
                     instances = scenario.get_instances()
-        if self.cache_instances and not os.path.exists(input_instances_file_path):
+
+        if self.cache_instances and not input_instances_file_path.exists():
             # Save instances to file
-            ensure_directory_exists(input_instances_output_path)
             write(
-                os.path.join(input_instances_file_path),
-                json.dumps([asdict_without_nones(instance) for instance in instances], indent=2),
+                input_instance_output_path, "input_instances.json",
+                content=json.dumps([asdict_without_nones(instance) for instance in instances], indent=2),
+                local_base_path=self.local_base_path,
+                cloud_base_path=self.cloud_base_path
             )
+
         if self.cache_instances_only:
             return  # Exit after saving the instances.
 
@@ -248,20 +283,41 @@ class Runner:
             return
 
         # Output benchmarking information and results to files
-        write(os.path.join(run_path, "run_spec.json"), json.dumps(asdict_without_nones(run_spec), indent=2))
+        write(
+            run_path, "run_spec.json",
+            content=json.dumps(asdict_without_nones(run_spec), indent=2),
+            local_base_path=self.local_base_path,
+            cloud_base_path=self.cloud_base_path
+        )
 
         # Write out scenario
-        write(os.path.join(run_path, "scenario.json"), json.dumps(asdict_without_nones(scenario), indent=2))
+        write(
+            run_path, "scenario.json",
+            content=json.dumps(asdict_without_nones(scenario), indent=2, default=str),
+            local_base_path=self.local_base_path,
+            cloud_base_path=self.cloud_base_path
+        )
 
         # Write scenario state
-        write(os.path.join(run_path, "scenario_state.json"), json.dumps(asdict_without_nones(scenario_state), indent=2))
+        write(
+            run_path, "scenario_state.json",
+            content=json.dumps(asdict_without_nones(scenario_state), indent=2, default=str),
+            local_base_path=self.local_base_path,
+            cloud_base_path=self.cloud_base_path
+        )
 
         write(
-            os.path.join(run_path, "stats.json"), json.dumps([asdict_without_nones(stat) for stat in stats], indent=2)
+            run_path, "states.json",
+            content=json.dumps([asdict_without_nones(stat) for stat in stats], indent=2, default=str),
+            local_base_path=self.local_base_path,
+            cloud_base_path=self.cloud_base_path
         )
+
         write(
-            os.path.join(run_path, "per_instance_stats.json"),
-            json.dumps(list(map(asdict_without_nones, per_instance_stats)), indent=2),
+            run_path, "per_instance_stats.json",
+            content=json.dumps(list(map(asdict_without_nones, per_instance_stats)), indent=2, default=str),
+            local_base_path=self.local_base_path,
+            cloud_base_path=self.cloud_base_path
         )
 
         cache_stats.print_status()
